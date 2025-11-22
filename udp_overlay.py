@@ -19,7 +19,7 @@ import base64
 
 # Configuration provided by Shannigrahi
 PORT = 5000
-BROADCAST_IP = "10.105.255.255"     # Make sure to change the broadcast ip when necessary. ipconfig or ifconfig
+BROADCAST_IP = "192.168.1.255"     # Make sure to change the broadcast ip when necessary. ipconfig or ifconfig
 SYNC_INTERVAL = 5
 PING_INTERVAL = 15
 PING_TIMEOUT = 3
