@@ -1,443 +1,490 @@
-#!/usr/bin/env python3
-"""
-UDP Overlay Networking - Sprint 6.2 Format with Model Update Support
--------------------------------------------------------------------
-Maintains the original Sprint 6.2 packet format:
-[<msgtype>]|<node_id>|<seq>|<timestamp>|<model_ver>|<ttl>|<body>|<crc_hex>
 
-Now includes support for:
-- MODEL_META: Announce model delta metadata
-- MODEL_CHUNK: Send model delta fragments
+"""
+UDP Overlay Networking — Reference Solution (Instructor)
+-------------------------------------------------------
+- Peer discovery via UDP broadcast [PEER_SYNC]
+- Liveness via [PING]/[PONG]
+- Periodic pruning of inactive peers
+- Summary printer for debugging
+- Lightweight model update message flow ([MODEL_META] + [MODEL_CHUNK])
+
+Packet format (ASCII, one line per datagram):
+V=1|SRC=<node_id>|SEQ=<int>|TYPE=<msgtype>|TS=<epoch_ms>|BODY=<opaque>
+
+Msg types and bodies:
+- PEER_SYNC   BODY: ip=<a.b.c.d>;port=<int>
+- PING        BODY: t0=<epoch_ms>
+- PONG        BODY: t0=<epoch_ms>
+- MODEL_META  BODY: ver=<str>;size=<int>;chunks=<int>;sha256=<hex>
+- MODEL_CHUNK BODY: ver=<str>;idx=<int>;total=<int>;b64=<...>
+
+Notes for Raspberry Pi:
+- Uses only Python stdlib; no heavy dependencies
+- Socket configured with SO_BROADCAST and SO_REUSEADDR
+- Local IP detection uses UDP connect() trick (no packets sent)
+
+This file implements the full solution requested by the instructor.
+Keep function signatures intact so student skeletons remain compatible.
 """
 
+import base64
 import socket
 import threading
 import time
-import struct
-import zlib
-import base64
+from typing import Tuple
 
-# Configuration provided by Shannigrahi
+# ---------- Global Configuration ----------
 PORT = 5000
-BROADCAST_IP = "10.143.255.255"     # Make sure to change the broadcast ip when necessary. ipconfig or ifconfig
+BROADCAST_IP = "10.143.255.255"
 SYNC_INTERVAL = 5
 PING_INTERVAL = 15
 PING_TIMEOUT = 3
 REMOVE_TIMEOUT = 30
 
+
 class PeerNode:
+    """
+    Represents a single node in the decentralized chatbot overlay.
+    Implements UDP broadcast discovery, heartbeat, and model-update messages.
+    """
 
     def __init__(self, node_id: str):
-        self.id = node_id       # Node id that is passed in by user 
-        self.ip = self._get_local_ip()
+        """Initialize node state, socket, and peer table."""
+        self.id = node_id
+        self.ip = None
         self.port = PORT
         self.seq = 0
         self.sock = None
-        self.peers = {}         # Our dict of peers
+        # peers: {peer_id: {"ip": str, "port": int, "last_seen": float, "rtt": float|None,
+        #                   "model_ver": str|None, "chunks_recv": int|None, "chunks_total": int|None}}
+        self.peers = {}
         self.running = False
         self.lock = threading.Lock()
-        self.ping_times = {}
-        
-        # Add model buffers for storing incoming model chunks
-        self._model_buffers = {}  # {ver: {"total": int, "parts": dict[idx->bytes], "sha256": str, "size": int}}
-        
-        self._setup_socket()
-        print(f"[INIT] Node {self.id} initialized at {self.ip}:{self.port}")
+        # rudimentary in-memory model update buffer
+        self._model_buffers = {}  # {ver: {"total": int, "parts": dict[idx->bytes], "sha256": str, "sender": str, "last_update": float, "last_nak": float}}
+        self._sent_chunks = {}    # {ver: {"total": int, "parts": dict[idx->bytes]}}
 
-    def _setup_socket(self):    # Set up UDP socket
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # Enabled SO_REUSEPORT to allow multiple processes on same port
-        if hasattr(socket, 'SO_REUSEPORT'):
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.bind(('', self.port))
-        self.sock.settimeout(1.0)  # Timeout set to one second
+        self._setup_socket()
+        self.ip = self._get_local_ip()
+
+    # ---------- Setup ----------
+    def _setup_socket(self):
+        """Create and configure UDP socket for broadcast and unicast."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except Exception:
+            pass  # not available on all platforms
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.bind(("", PORT))  # listen on all interfaces
+        self.sock = s
 
     def _get_local_ip(self):
+        """Return the local IP address of this host."""
+        ip = "127.0.0.1"
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)    # Get the local ip address for the machine
-            s.connect(("8.8.8.8", 80))      # 8.8.8.8 = external
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
+            tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                tmp.connect(("8.8.8.8", 80))  # no packets actually sent
+                ip = tmp.getsockname()[0]
+            finally:
+                tmp.close()
         except Exception:
-            return "127.0.0.1"      # Set ip to loopback address if attempt failed
+            pass
+        return ip
 
+    # ---------- Message Handling ----------
     def _next_seq(self):
+        """Increment and return the next sequence number."""
         with self.lock:
             self.seq += 1
             return self.seq
 
-    def _make_packet(self, msgtype: str, body: str, model_ver: int = 0) -> str:
-        timestamp = int(time.time() * 1000)  # UNIX epoch in ms as told by Shannigrahi
-        ttl = 3         # Time to live = 3 hops
+    def _make_packet(self, msgtype: str, body: str) -> str:
+        """Build packet string according to format spec."""
+        ts_ms = int(time.time() * 1000)
         seq = self._next_seq()
-        
-        header_body = f"[{msgtype}]|{self.id}|{seq}|{timestamp}|{model_ver}|{ttl}|{body}"
-        
-        # Calculate Checksum
-        crc = zlib.crc32(header_body.encode()) & 0xffffffff
-        crc_hex = format(crc, '08x')        # Hex format
-        
-        packet = f"{header_body}|{crc_hex}"
-        return packet
+        fields = [
+            f"V=1",
+            f"SRC={self.id}",
+            f"SEQ={seq}",
+            f"TYPE={msgtype}",
+            f"TS={ts_ms}",
+            f"BODY={body}",
+        ]
+        return "|".join(fields)
 
-    def _send(self, data: str, addr: tuple):        # Send UDP pkt to address
+    def _send(self, data: str, addr: Tuple[str, int]):
+        """Send encoded UDP packet to destination."""
         try:
-            self.sock.sendto(data.encode(), addr)
+            self.sock.sendto(data.encode("utf-8"), addr)
         except Exception as e:
-            print(f"[ERROR] Failed to send to {addr}: {e}")
+            print(f"[ERROR] send to {addr} failed: {e}")
 
-    def _verify_crc(self, packet: str) -> bool:         # Validate checksum of entire message
-        try:
-            parts = packet.rsplit('|', 1)       # Fixed format 
-            if len(parts) != 2:
-                return False
-            
-            header_body = parts[0]
-            crc_received = parts[1]
-            
-            crc_calculated = zlib.crc32(header_body.encode()) & 0xffffffff
-            crc_hex = format(crc_calculated, '08x')
-            
-            return crc_hex == crc_received
-        except Exception:
-            return False
+    # ---------- Overlay Operations ----------
+    def broadcast_sync(self):
+        """Broadcast [PEER_SYNC] message to announce presence."""
+        body = f"ip={self.ip};port={self.port}"
+        pkt = self._make_packet("PEER_SYNC", body)
+        self._send(pkt, (BROADCAST_IP, PORT))
 
-    def broadcast_sync(self):           # Announce yourself to anyone listening with a special PEER_SYNC pkt
-        body = f"{self.ip},{self.port}"
-        packet = self._make_packet("PEER_SYNC", body)
-        self._send(packet, (BROADCAST_IP, self.port))
+    def send_ping(self, peer_id: str, peer_info: dict):
+        """Send [PING] message to a specific peer."""
+        t0 = int(time.time() * 1000)
+        body = f"t0={t0}"
+        pkt = self._make_packet("PING", body)
+        self._send(pkt, (peer_info["ip"], peer_info["port"]))
 
-    def send_ping(self, peer_id: str, peer_info: dict): # Send ping to peer to make sure they are still alive
-        timestamp = int(time.time() * 1000)
-        body = f"{self.ip},{timestamp}"
-        packet = self._make_packet("PING", body)
-        
-        peer_addr = (peer_info["ip"], peer_info["port"])
-        self._send(packet, peer_addr)
-        
-        # Record ping time for RTT calculation
-        with self.lock:
-            self.ping_times[peer_id] = timestamp
+    def send_pong(self, addr: Tuple[str, int]):
+        """Send [PONG] message back to sender."""
+        # echo original timestamp if present
+        body = f"t0={int(time.time() * 1000)}"
+        pkt = self._make_packet("PONG", body)
+        self._send(pkt, addr)
 
-    def send_pong(self, addr: tuple):   # Respond to ping with pong
-        body = f"{self.ip},ok,0"
-        packet = self._make_packet("PONG", body)
-        self._send(packet, addr)
-
-    # ========== Model Update Helper Methods ==========
-    def announce_model_meta(self, ver: str, size: int, chunks: int, sha256_hex: str):
-        """Broadcast MODEL_META message to announce a model delta"""
+    # --- Model update helpers (optional hooks for TinyLlama weights over LAN) ---
+    def _announce_model_meta(self, ver: str, size: int, chunks: int, sha256_hex: str):
         body = f"ver={ver};size={size};chunks={chunks};sha256={sha256_hex}"
-        packet = self._make_packet("MODEL_META", body)
-        self._send(packet, (BROADCAST_IP, self.port))
-        print(f"[MODEL] Announced model ver={ver}, chunks={chunks}, sha256={sha256_hex[:8]}...")
+        pkt = self._make_packet("MODEL_META", body)
+        self._send(pkt, (BROADCAST_IP, PORT))
 
-    def send_model_chunk(self, ver: str, idx: int, total: int, raw_bytes: bytes, dst: tuple):
-        """Send a MODEL_CHUNK message to a specific destination"""
+    def _send_model_chunk(self, ver: str, idx: int, total: int, raw_bytes: bytes, dst: Tuple[str, int]):
         b64 = base64.b64encode(raw_bytes).decode("ascii")
         body = f"ver={ver};idx={idx};total={total};b64={b64}"
-        packet = self._make_packet("MODEL_CHUNK", body)
-        self._send(packet, dst)
+        pkt = self._make_packet("MODEL_CHUNK", body)
+        self._send(pkt, dst)
+
+    def _cache_chunk(self, ver: str, idx: int, total: int, raw_bytes: bytes):
+        buf = self._sent_chunks.setdefault(ver, {"total": total, "parts": {}})
+        buf["parts"][idx] = raw_bytes
+        buf["total"] = total
+
+    # Public-facing helpers used by update_exchanges.py
+    def announce_model_meta(self, ver: str, size: int, chunks: int, sha256_hex: str):
+        self._announce_model_meta(ver, size, chunks, sha256_hex)
+
+    def send_model_chunk(self, ver: str, idx: int, total: int, raw_bytes: bytes, dst: Tuple[str, int]):
+        self._cache_chunk(ver, idx, total, raw_bytes)
+        self._send_model_chunk(ver, idx, total, raw_bytes, dst)
 
     def broadcast_model_chunk(self, ver: str, idx: int, total: int, raw_bytes: bytes):
-        """Broadcast a MODEL_CHUNK message to all peers"""
-        b64 = base64.b64encode(raw_bytes).decode("ascii")
-        body = f"ver={ver};idx={idx};total={total};b64={b64}"
-        packet = self._make_packet("MODEL_CHUNK", body)
-        self._send(packet, (BROADCAST_IP, self.port))
+        self._cache_chunk(ver, idx, total, raw_bytes)
+        # broadcast to all peers
+        self._send_model_chunk(ver, idx, total, raw_bytes, (BROADCAST_IP, PORT))
 
-    def is_model_complete(self, ver: str) -> bool:
-        """Check if all chunks for a model version have been received"""
-        if ver not in self._model_buffers:
-            return False
-        buf = self._model_buffers[ver]
-        return len(buf["parts"]) == buf["total"]
-
-    def get_reassembled_model(self, ver: str) -> bytes:
-        """Reassemble all chunks for a model version into complete data"""
-        if not self.is_model_complete(ver):
-            return None
-        
-        buf = self._model_buffers[ver]
-        data = b""
-        for i in range(buf["total"]):
-            if i not in buf["parts"]:
-                print(f"[MODEL] Missing chunk {i} for version {ver}")
-                return None
-            data += buf["parts"][i]
-        return data
-
-    def handle_message(self, msg: str, addr: tuple):    # Function to parse incoming packets
+    # -------------------------------------------------------------------------
+    def handle_message(self, msg: str, addr: Tuple[str, int]):
+        """Parse and process incoming UDP packet."""
         try:
-            # Verify checksum
-            if not self._verify_crc(msg):
-                print(f"[CRC] Invalid CRC from {addr}")
+            parts = msg.strip().split("|")
+            kv = {}
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    kv[k] = v
+            if kv.get("V") != "1":
                 return
-            
-            # Parse packet
-            parts = msg.split('|')
-            if len(parts) < 8:
-                print(f"[PARSE] Malformed packet from {addr}")
-                return
-            
-            msgtype = parts[0].strip('[]')
-            sender_id = parts[1]
-            seq_id = parts[2]
-            timestamp = int(parts[3])
-            model_ver = parts[4]
-            ttl = parts[5]
-            body = parts[6]
-            
-            # Ignore own messages
-            if sender_id == self.id:
-                return
-            
-            current_time = int(time.time())
-            
-            # Handle different message types
-            if msgtype == "PEER_SYNC":
-                body_parts = body.split(',')
-                if len(body_parts) == 2:
-                    peer_ip = body_parts[0]
-                    peer_port = int(body_parts[1])
-                    
+            src = kv.get("SRC")
+            if not src or src == self.id:
+                return  # ignore our own packets or malformed
+            mtype = kv.get("TYPE", "")
+            body = kv.get("BODY", "")
+            allowed = {"PEER_SYNC", "PING", "PONG", "MODEL_META", "MODEL_CHUNK", "CHUNK_NAK"}
+            if mtype not in allowed:
+                return  # ignore foreign/unknown traffic
+
+            # update peer last_seen
+            now = time.time()
+            with self.lock:
+                peer = self.peers.get(src)
+                if not peer:
+                    self.peers[src] = {
+                        "ip": addr[0],
+                        "port": addr[1],
+                        "last_seen": now,
+                        "rtt": None,
+                        "model_ver": None,
+                        "chunks_recv": None,
+                        "chunks_total": None,
+                    }
+                else:
+                    peer["last_seen"] = now
+                    peer["ip"], peer["port"] = addr[0], addr[1]
+
+            # handle types
+            if mtype == "PEER_SYNC":
+                # If we newly heard about this peer, we could respond with a ping to accelerate RTT learning
+                pass
+
+            elif mtype == "PING":
+                self.send_pong(addr)
+
+            elif mtype == "PONG":
+                # compute RTT if they echoed t0
+                t0 = None
+                for token in body.split(";"):
+                    if token.startswith("t0="):
+                        try:
+                            t0 = int(token.split("=", 1)[1])
+                        except Exception:
+                            t0 = None
+                if t0 is not None:
+                    rtt_ms = int(time.time() * 1000) - t0
                     with self.lock:
-                        if sender_id not in self.peers:
-                            print(f"[SYNC] Added {sender_id} ({peer_ip})")
-                        
-                        self.peers[sender_id] = {
-                            "ip": peer_ip,
-                            "port": peer_port,
-                            "last_seen": current_time,
-                            "status": "active"
-                        }
-            
-            elif msgtype == "PING":
-                body_parts = body.split(',')
-                if len(body_parts) == 2:
-                    # Update peer's last_seen
-                    with self.lock:
-                        if sender_id in self.peers:
-                            self.peers[sender_id]["last_seen"] = current_time
-                    
-                    # Send PONG response
-                    self.send_pong(addr)
-            
-            elif msgtype == "PONG":
-                with self.lock:
-                    if sender_id in self.ping_times:
-                        sent_time = self.ping_times[sender_id]
-                        current_time_ms = int(time.time() * 1000)
-                        rtt = current_time_ms - sent_time
-                        del self.ping_times[sender_id]
-                        
-                        if sender_id in self.peers:
-                            self.peers[sender_id]["last_seen"] = current_time
-                        
-                        print(f"[PING] RTT={rtt}ms to {sender_id}")
-            
-            elif msgtype == "MODEL_META":
-                # Parse model metadata announcement
+                        if src in self.peers:
+                            self.peers[src]["rtt"] = rtt_ms
+
+            elif mtype == "MODEL_META":
+                # track intent to receive model version
                 meta = {}
                 for token in body.split(";"):
                     if "=" in token:
                         k, v = token.split("=", 1)
                         meta[k] = v
-                
                 ver = meta.get("ver")
                 total = int(meta.get("chunks", "0") or 0)
-                size = int(meta.get("size", "0") or 0)
                 sha = meta.get("sha256", "")
-                
                 if ver and total > 0:
-                    # Initialize buffer for this model version
-                    self._model_buffers[ver] = {
-                        "total": total,
-                        "parts": {},
-                        "sha256": sha,
-                        "size": size,
-                        "sender": sender_id
-                    }
-                    
-                    # Update peer info
+                    self._model_buffers.setdefault(
+                        ver,
+                        {
+                            "total": total,
+                            "parts": {},
+                            "sha256": sha,
+                            "sender": src,
+                            "last_update": now,
+                            "last_nak": 0.0,
+                        },
+                    )
                     with self.lock:
-                        if sender_id in self.peers:
-                            self.peers[sender_id]["model_ver"] = ver
-                            self.peers[sender_id]["chunks_recv"] = 0
-                            self.peers[sender_id]["chunks_total"] = total
-                    
-                    print(f"[MODEL] Announced ver={ver} total={total} size={size} from {sender_id}")
-            
-            elif msgtype == "MODEL_CHUNK":
-                # Parse model chunk
+                        self.peers[src]["model_ver"] = ver
+                        self.peers[src]["chunks_recv"] = 0
+                        self.peers[src]["chunks_total"] = total
+                print(f"[MODEL] announced ver={ver} total={total} from {src}")
+
+            elif mtype == "MODEL_CHUNK":
                 fields = {}
                 for token in body.split(";"):
                     if "=" in token:
                         k, v = token.split("=", 1)
                         fields[k] = v
-                
                 ver = fields.get("ver")
                 idx = int(fields.get("idx", "-1"))
                 total = int(fields.get("total", "0"))
                 b64 = fields.get("b64", "")
-                
                 if ver is None or idx < 0:
                     return
-                
-                # Initialize buffer if not exists
-                if ver not in self._model_buffers:
-                    self._model_buffers[ver] = {
-                        "total": total,
-                        "parts": {},
-                        "sha256": "",
-                        "size": 0,
-                        "sender": sender_id
-                    }
-                
-                buf = self._model_buffers[ver]
-                
+                buf = self._model_buffers.setdefault(
+                    ver,
+                    {"total": total, "parts": {}, "sha256": "", "sender": src, "last_update": now, "last_nak": 0.0},
+                )
                 try:
-                    # Decode and store chunk
-                    chunk_data = base64.b64decode(b64.encode("ascii"))
-                    buf["parts"][idx] = chunk_data
-                    
-                    # Update peer info
+                    buf["parts"][idx] = base64.b64decode(b64.encode("ascii"))
+                    buf["last_update"] = now
                     with self.lock:
-                        if sender_id in self.peers:
-                            self.peers[sender_id]["chunks_recv"] = len(buf["parts"])
-                            self.peers[sender_id]["chunks_total"] = total
-                    
-                    # Check if model is complete
+                        if src in self.peers:
+                            self.peers[src]["chunks_recv"] = len(buf["parts"])
+                            self.peers[src]["chunks_total"] = total
                     if self.is_model_complete(ver):
-                        print(f"[MODEL] Completed receiving ver={ver} ({len(buf['parts'])}/{buf['total']} chunks)")
-                        # Note: Actual model application would happen in delta_sync.py
-                    else:
-                        if idx % 10 == 0:  # Print progress every 10 chunks
-                            print(f"[MODEL] Chunk {idx}/{total} received for ver={ver}")
-                    
+                        print(f"[MODEL] complete ver={ver} ({len(buf['parts'])}/{buf['total']} chunks)")
                 except Exception as e:
-                    print(f"[MODEL] Chunk decode error: {e}")
-        
+                    print(f"[MODEL] chunk decode error: {e}")
+                # (Instructor note) Real implementation would verify SHA256 after reassembly and persist to disk.
+
+            elif mtype == "CHUNK_NAK":
+                fields = {}
+                for token in body.split(";"):
+                    if "=" in token:
+                        k, v = token.split("=", 1)
+                        fields[k] = v
+                ver = fields.get("ver")
+                if not ver:
+                    return
+                missing_field = fields.get("missing", "")
+                try:
+                    missing = [int(tok.strip()) for tok in missing_field.split(",") if tok.strip().isdigit()]
+                except Exception:
+                    missing = []
+                cache = self._sent_chunks.get(ver, {})
+                total = cache.get("total", 0)
+                for idx in missing:
+                    chunk = cache.get("parts", {}).get(idx)
+                    if chunk is not None:
+                        self.send_model_chunk(ver, idx, total, chunk, addr)
+                        print(f"[NAK] resent chunk {idx} for ver={ver} to {addr}")
+
+            # else: ignore unknown types to preserve extensibility
         except Exception as e:
-            print(f"[ERROR] Failed to handle message from {addr}: {e}")
+            print(f"[ERROR] handle_message failed from {addr}: {e}")
 
+    # ---------- Thread Tasks ----------
     def listener(self):
-        while self.running:     # Basically while true listen for packets
+        """Continuously listen for incoming packets."""
+        while self.running:
             try:
-                data, addr = self.sock.recvfrom(65535)  # Increased buffer size for MODEL_CHUNK messages
-                msg = data.decode()
+                data, addr = self.sock.recvfrom(65535)
+                msg = data.decode("utf-8", errors="ignore")
                 self.handle_message(msg, addr)
-            except socket.timeout:
-                continue
+            except OSError:
+                break
             except Exception as e:
-                if self.running:
-                    print(f"[ERROR] Listener error: {e}")
+                print(f"[ERROR] listener: {e}")
 
-    def broadcaster(self):      # Broadcast while running and sleep during interval (5 seconds set at top)
+    def broadcaster(self):
+        """Periodically broadcast PEER_SYNC messages."""
         while self.running:
             self.broadcast_sync()
             time.sleep(SYNC_INTERVAL)
 
-    def heartbeat(self):        # Sleep for interval and then ping (15 seconds set at top)
+    def heartbeat(self):
+        """Send pings and remove inactive peers."""
         while self.running:
-            time.sleep(PING_INTERVAL)   # 15s
-            
-            if not self.running:
-                break
-            
-            current_time = int(time.time())
-            peers_to_remove = []
-            
-            with self.lock:                             # Copy peers list to 
-                peers_list = list(self.peers.items())
-            
-            for peer_id, peer_info in peers_list:       
-                # Check if peer has timed out        
-                if current_time - peer_info["last_seen"] > REMOVE_TIMEOUT:
-                    peers_to_remove.append(peer_id)
-                else:
-                    # Send ping to active peer
-                    self.send_ping(peer_id, peer_info)
-            
-            # Remove inactive peers
-            for peer_id in peers_to_remove:
+            now = time.time()
+            to_remove = []
+            with self.lock:
+                items = list(self.peers.items())
+            for pid, info in items:
+                # ping if due
+                if (now - info["last_seen"]) >= PING_INTERVAL:
+                    self.send_ping(pid, info)
+                # prune if stale
+                if (now - info["last_seen"]) >= REMOVE_TIMEOUT:
+                    to_remove.append(pid)
+            if to_remove:
                 with self.lock:
-                    if peer_id in self.peers:
-                        del self.peers[peer_id]
-                        print(f"[DROP] {peer_id} removed (timeout)")
+                    for pid in to_remove:
+                        self.peers.pop(pid, None)
+                        print(f"[PRUNE] removed {pid}")
+            time.sleep(1)
 
     def summary(self):
+        """Print peer-table summary periodically."""
         while self.running:
-            time.sleep(10)  # Interval for logging updates (changed to 10s for less spam)
             with self.lock:
-                active_count = len(self.peers)
-                if active_count > 0:
-                    print(f"\n[TABLE] {active_count} active peers")
-                    for peer_id, info in self.peers.items():
-                        age = int(time.time()) - info['last_seen']
-                        extra = ""
-                        
-                        # Add model info if available
-                        if "model_ver" in info:
-                            mv = info.get("model_ver")
-                            cr = info.get("chunks_recv", 0)
-                            ct = info.get("chunks_total", 0)
-                            extra = f" | model={mv} {cr}/{ct}"
-                        
-                        print(f"  - {peer_id}: {info['ip']}:{info['port']} (last seen {age}s ago){extra}")
-                else:
-                    print(f"\n[TABLE] No peers discovered yet")
-            
-            # Also print model buffer status
-            if self._model_buffers:
-                print("[MODEL BUFFERS]")
-                for ver, buf in self._model_buffers.items():
-                    progress = len(buf["parts"])
-                    total = buf["total"]
-                    sender = buf.get("sender", "unknown")
-                    status = "COMPLETE" if progress == total else "IN_PROGRESS"
-                    print(f"  - ver={ver}: {progress}/{total} chunks [{status}] from {sender}")
+                peers_copy = dict(self.peers)
+            if peers_copy:
+                print("\n[SUMMARY] Peers:")
+                for pid, p in peers_copy.items():
+                    age = int(time.time() - p["last_seen"]) if p.get("last_seen") else -1
+                    rtt = p.get("rtt")
+                    mv = p.get("model_ver")
+                    cr = p.get("chunks_recv")
+                    ct = p.get("chunks_total")
+                    extra = f" rtt={rtt}ms" if rtt is not None else ""
+                    if mv:
+                        extra += f" | model={mv} {cr}/{ct}"
+                    print(f" - {pid}@{p['ip']}:{p['port']} seen={age}s ago{extra}")
+            else:
+                print("\n[SUMMARY] No peers known yet.")
+            time.sleep(10)
 
-    # Start and stop node
+    def retransmit_manager(self):
+        """Request missing chunks and handle retries with NAKs."""
+        while self.running:
+            time.sleep(2)
+            now = time.time()
+            with self.lock:
+                buffers = dict(self._model_buffers)
+                peers_copy = dict(self.peers)
+            for ver, buf in buffers.items():
+                total = buf.get("total", 0)
+                parts = buf.get("parts", {})
+                sender = buf.get("sender")
+                last_update = buf.get("last_update", 0)
+                last_nak = buf.get("last_nak", 0)
+
+                if not sender or total == 0 or ver not in self._model_buffers:
+                    continue
+                if self.is_model_complete(ver):
+                    continue
+                if now - last_update < 3:
+                    continue  # give time for natural progress
+                if now - last_nak < 3:
+                    continue  # avoid spamming
+                if sender not in peers_copy:
+                    continue
+
+                missing = [i for i in range(total) if i not in parts]
+                if not missing:
+                    continue
+
+                missing_slice = missing[:25]  # cap request size
+                body = f"ver={ver};missing={','.join(str(m) for m in missing_slice)}"
+                pkt = self._make_packet("CHUNK_NAK", body)
+                peer_addr = (peers_copy[sender]["ip"], peers_copy[sender]["port"])
+                self._send(pkt, peer_addr)
+                with self.lock:
+                    if ver in self._model_buffers:
+                        self._model_buffers[ver]["last_nak"] = now
+                print(f"[NAK] requested {len(missing_slice)} missing chunks for ver={ver} from {sender}")
+
+    # ---------- Model buffer helpers ----------
+    def is_model_complete(self, ver: str) -> bool:
+        buf = self._model_buffers.get(ver)
+        if not buf:
+            return False
+        return len(buf["parts"]) == buf.get("total", 0)
+
+    def get_reassembled_model(self, ver: str):
+        buf = self._model_buffers.get(ver)
+        if not buf or not self.is_model_complete(ver):
+            return None
+        data = b""
+        try:
+            for i in range(buf["total"]):
+                data += buf["parts"][i]
+            return data
+        except Exception:
+            return None
+
+    # ---------- Control ----------
     def start(self):
+        """Start listener, broadcaster, heartbeat, and summary threads."""
+        if self.running:
+            return
         self.running = True
-        
-        # Start the threads
-        threading.Thread(target=self.listener, daemon=True).start()
-        threading.Thread(target=self.broadcaster, daemon=True).start()
-        threading.Thread(target=self.heartbeat, daemon=True).start()
-        threading.Thread(target=self.summary, daemon=True).start()
-        
-        print(f"[START] Node {self.id} started")
+        self._threads = [
+            threading.Thread(target=self.listener, daemon=True),
+            threading.Thread(target=self.broadcaster, daemon=True),
+            threading.Thread(target=self.heartbeat, daemon=True),
+            threading.Thread(target=self.summary, daemon=True),
+            threading.Thread(target=self.retransmit_manager, daemon=True),
+        ]
+        for t in self._threads:
+            t.start()
+        print(f"[START] {self.id} on {self.ip}:{self.port}")
 
     def stop(self):
-        print(f"[STOP] Stopping node {self.id}...")
+        """Stop all threads and close socket."""
+        if not self.running:
+            return
         self.running = False
-        time.sleep(2)  # Give the threads time to stop
-        
-        if self.sock:
+        try:
+            # poke the socket to unblock recvfrom if needed
+            self.sock.settimeout(0.1)
+        except Exception:
+            pass
+        for t in getattr(self, "_threads", []):
+            t.join(timeout=1)
+        try:
             self.sock.close()
-        
-        print(f"[STOP] Node {self.id} stopped")
+        except Exception:
+            pass
+        print("[STOP] node stopped")
 
 
 # ---------- Entry Point ----------
 if __name__ == "__main__":
     import sys
-    
     if len(sys.argv) < 2:
-        print("Usage: python udp_overlay.py <node_id>")
+        print("Usage: python node_interface.py <node_id>")
         exit(1)
-    
+
     node_id = sys.argv[1]
     node = PeerNode(node_id)
     node.start()
-    
+
     try:
         while True:
             time.sleep(1)
