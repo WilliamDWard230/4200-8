@@ -1,36 +1,9 @@
 
-"""
-UDP Overlay Networking — Reference Solution (Instructor)
--------------------------------------------------------
-- Peer discovery via UDP broadcast [PEER_SYNC]
-- Liveness via [PING]/[PONG]
-- Periodic pruning of inactive peers
-- Summary printer for debugging
-- Lightweight model update message flow ([MODEL_META] + [MODEL_CHUNK])
-
-Packet format (ASCII, one line per datagram):
-V=1|SRC=<node_id>|SEQ=<int>|TYPE=<msgtype>|TS=<epoch_ms>|BODY=<opaque>
-
-Msg types and bodies:
-- PEER_SYNC   BODY: ip=<a.b.c.d>;port=<int>
-- PING        BODY: t0=<epoch_ms>
-- PONG        BODY: t0=<epoch_ms>
-- MODEL_META  BODY: ver=<str>;size=<int>;chunks=<int>;sha256=<hex>
-- MODEL_CHUNK BODY: ver=<str>;idx=<int>;total=<int>;b64=<...>
-
-Notes for Raspberry Pi:
-- Uses only Python stdlib; no heavy dependencies
-- Socket configured with SO_BROADCAST and SO_REUSEADDR
-- Local IP detection uses UDP connect() trick (no packets sent)
-
-This file implements the full solution requested by the instructor.
-Keep function signatures intact so student skeletons remain compatible.
-"""
-
 import base64
 import socket
 import threading
 import time
+import zlib
 from typing import Tuple
 
 # ---------- Global Configuration ----------
@@ -43,69 +16,65 @@ REMOVE_TIMEOUT = 30
 
 
 class PeerNode:
-    """
-    Represents a single node in the decentralized chatbot overlay.
-    Implements UDP broadcast discovery, heartbeat, and model-update messages.
-    """
 
     def __init__(self, node_id: str):
-        """Initialize node state, socket, and peer table."""
         self.id = node_id
         self.ip = None
         self.port = PORT
         self.seq = 0
         self.sock = None
-        # peers: {peer_id: {"ip": str, "port": int, "last_seen": float, "rtt": float|None,
-        #                   "model_ver": str|None, "chunks_recv": int|None, "chunks_total": int|None}}
         self.peers = {}
         self.running = False
         self.lock = threading.Lock()
-        # rudimentary in-memory model update buffer
-        self._model_buffers = {}  # {ver: {"total": int, "parts": dict[idx->bytes], "sha256": str, "sender": str, "last_update": float, "last_nak": float}}
-        self._sent_chunks = {}    # {ver: {"total": int, "parts": dict[idx->bytes]}}
+
+        self._model_buffers = {}  
+        self._sent_chunks = {}   
 
         self._setup_socket()
         self.ip = self._get_local_ip()
 
     # ---------- Setup ----------
     def _setup_socket(self):
-        """Create and configure UDP socket for broadcast and unicast."""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except Exception:
             pass  # not available on all platforms
+
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         s.bind(("", PORT))  # listen on all interfaces
         self.sock = s
 
     def _get_local_ip(self):
-        """Return the local IP address of this host."""
-        ip = "127.0.0.1"
+
         try:
             tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
             try:
                 tmp.connect(("8.8.8.8", 80))  # no packets actually sent
                 ip = tmp.getsockname()[0]
             finally:
                 tmp.close()
+
         except Exception:
             pass
-        return ip
+        return "127.0.0.1"
 
-    # ---------- Message Handling ----------
+
     def _next_seq(self):
-        """Increment and return the next sequence number."""
+
         with self.lock:
             self.seq += 1
+
             return self.seq
 
     def _make_packet(self, msgtype: str, body: str) -> str:
-        """Build packet string according to format spec."""
+
         ts_ms = int(time.time() * 1000)
         seq = self._next_seq()
-        fields = [
+        fields = [              #new format provided by shannigrahi
             f"V=1",
             f"SRC={self.id}",
             f"SEQ={seq}",
@@ -116,34 +85,28 @@ class PeerNode:
         return "|".join(fields)
 
     def _send(self, data: str, addr: Tuple[str, int]):
-        """Send encoded UDP packet to destination."""
         try:
             self.sock.sendto(data.encode("utf-8"), addr)
         except Exception as e:
             print(f"[ERROR] send to {addr} failed: {e}")
 
-    # ---------- Overlay Operations ----------
     def broadcast_sync(self):
-        """Broadcast [PEER_SYNC] message to announce presence."""
         body = f"ip={self.ip};port={self.port}"
         pkt = self._make_packet("PEER_SYNC", body)
         self._send(pkt, (BROADCAST_IP, PORT))
 
     def send_ping(self, peer_id: str, peer_info: dict):
-        """Send [PING] message to a specific peer."""
         t0 = int(time.time() * 1000)
         body = f"t0={t0}"
         pkt = self._make_packet("PING", body)
         self._send(pkt, (peer_info["ip"], peer_info["port"]))
 
     def send_pong(self, addr: Tuple[str, int]):
-        """Send [PONG] message back to sender."""
         # echo original timestamp if present
         body = f"t0={int(time.time() * 1000)}"
         pkt = self._make_packet("PONG", body)
         self._send(pkt, addr)
 
-    # --- Model update helpers (optional hooks for TinyLlama weights over LAN) ---
     def _announce_model_meta(self, ver: str, size: int, chunks: int, sha256_hex: str):
         body = f"ver={ver};size={size};chunks={chunks};sha256={sha256_hex}"
         pkt = self._make_packet("MODEL_META", body)
@@ -160,7 +123,7 @@ class PeerNode:
         buf["parts"][idx] = raw_bytes
         buf["total"] = total
 
-    # Public-facing helpers used by update_exchanges.py
+
     def announce_model_meta(self, ver: str, size: int, chunks: int, sha256_hex: str):
         self._announce_model_meta(ver, size, chunks, sha256_hex)
 
@@ -175,16 +138,18 @@ class PeerNode:
 
     # -------------------------------------------------------------------------
     def handle_message(self, msg: str, addr: Tuple[str, int]):
-        """Parse and process incoming UDP packet."""
         try:
             parts = msg.strip().split("|")
             kv = {}
+
             for p in parts:
                 if "=" in p:
                     k, v = p.split("=", 1)
                     kv[k] = v
+
             if kv.get("V") != "1":
                 return
+            
             src = kv.get("SRC")
             if not src or src == self.id:
                 return  # ignore our own packets or malformed
@@ -318,27 +283,28 @@ class PeerNode:
         except Exception as e:
             print(f"[ERROR] handle_message failed from {addr}: {e}")
 
-    # ---------- Thread Tasks ----------
+
     def listener(self):
-        """Continuously listen for incoming packets."""
+
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65535)
                 msg = data.decode("utf-8", errors="ignore")
                 self.handle_message(msg, addr)
+                
             except OSError:
                 break
             except Exception as e:
                 print(f"[ERROR] listener: {e}")
 
     def broadcaster(self):
-        """Periodically broadcast PEER_SYNC messages."""
+
         while self.running:
             self.broadcast_sync()
             time.sleep(SYNC_INTERVAL)
 
     def heartbeat(self):
-        """Send pings and remove inactive peers."""
+
         while self.running:
             now = time.time()
             to_remove = []
@@ -359,7 +325,7 @@ class PeerNode:
             time.sleep(1)
 
     def summary(self):
-        """Print peer-table summary periodically."""
+
         while self.running:
             with self.lock:
                 peers_copy = dict(self.peers)
@@ -380,7 +346,7 @@ class PeerNode:
             time.sleep(10)
 
     def retransmit_manager(self):
-        """Request missing chunks and handle retries with NAKs."""
+
         while self.running:
             time.sleep(2)
             now = time.time()
@@ -440,7 +406,7 @@ class PeerNode:
 
     # ---------- Control ----------
     def start(self):
-        """Start listener, broadcaster, heartbeat, and summary threads."""
+        
         if self.running:
             return
         self.running = True
@@ -456,7 +422,7 @@ class PeerNode:
         print(f"[START] {self.id} on {self.ip}:{self.port}")
 
     def stop(self):
-        """Stop all threads and close socket."""
+
         if not self.running:
             return
         self.running = False
