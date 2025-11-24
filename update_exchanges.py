@@ -14,7 +14,7 @@ def announce_model_meta(node, ver: str, size: int, chunks: int, sha: str):
 
 
 def fragment_and_send(node, ver: str, filepath: str, addr: Tuple[str, int] = None):
-    
+    # verify file
     if not os.path.exists(filepath):
         print(f"[ERROR] File not found: {filepath}")
         return 0
@@ -26,7 +26,7 @@ def fragment_and_send(node, ver: str, filepath: str, addr: Tuple[str, int] = Non
     file_size = len(data)
     sha256_hash = hashlib.sha256(data).hexdigest()
     
-
+    
     raw_chunk_size = int(MAX_CHUNK_SIZE * 3 / 4) 
     total_chunks = (file_size + raw_chunk_size - 1) // raw_chunk_size
     
@@ -39,11 +39,13 @@ def fragment_and_send(node, ver: str, filepath: str, addr: Tuple[str, int] = Non
         end = min(start + raw_chunk_size, file_size)
         chunk_data = data[start:end]
         
+        # send/broadcast chunks
         if addr:
             node.send_model_chunk(ver, idx, total_chunks, chunk_data, addr)
         else:
             node.broadcast_model_chunk(ver, idx, total_chunks, chunk_data)
         
+        # progress log for sent chunks
         if idx % 10 == 0 or idx == total_chunks - 1:
             print(f"[DELTA] Sent chunk {idx + 1}/{total_chunks} for ver={ver}")
     
@@ -53,6 +55,7 @@ def fragment_and_send(node, ver: str, filepath: str, addr: Tuple[str, int] = Non
 
 def handle_incoming_chunk(node, msg: str, addr: Tuple[str, int]):
 
+    # parse incoming messages
     try:
         parts = msg.split('|')
         if len(parts) < 7:
@@ -65,6 +68,7 @@ def handle_incoming_chunk(node, msg: str, addr: Tuple[str, int]):
                 k, v = token.split("=", 1)
                 fields[k] = v
         
+        # extract version
         ver = fields.get("ver")
         if not ver:
             return False
@@ -127,6 +131,8 @@ def receive_and_reassemble(node, ver: str, save_path: str = None) -> str:
 
 
 def get_pending_models(node) -> list:
+    
+    # build list of incomplete versions
     pending = []
 
     for ver, buf in node._model_buffers.items():
@@ -141,6 +147,7 @@ def get_pending_models(node) -> list:
 
 def get_complete_models(node) -> list:
 
+    # build list of complete versions
     complete = []
 
     for ver in node._model_buffers:
