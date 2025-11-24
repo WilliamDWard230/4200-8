@@ -8,7 +8,7 @@ from typing import Tuple
 
 # ---------- Global Configuration ----------
 PORT = 5000
-BROADCAST_IP = "10.143.255.255"
+BROADCAST_IP = "192.168.1.255"
 SYNC_INTERVAL = 5
 PING_INTERVAL = 15
 PING_TIMEOUT = 3
